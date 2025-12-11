@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+// src/pages/ManagerDashboard.tsx
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { api, Player, Team } from '../services/api';
@@ -6,9 +7,25 @@ import { initializeSocket } from '../services/socket';
 import MainAuctionView from '../components/MainAuctionView';
 import { Search, Filter, LogOut, TrendingUp, Users, DollarSign } from 'lucide-react';
 
+/**
+ * ManagerDashboard
+ *
+ * Fixes applied:
+ * - Polls backend every POLL_INTERVAL ms (default 3000). Controlled by VITE_POLL_INTERVAL.
+ * - Polling can be disabled by setting VITE_DISABLE_POLLING=true (useful for dev).
+ * - Replaces state on each fetch (no appending) to avoid duplicate names.
+ * - Normalizes strikeRate field so .toFixed won't crash and SR shows correctly.
+ * - initializeSocket() guarded so it's only called once per client session.
+ * - Polling is briefly suspended while write operations execute to avoid flicker.
+ */
+
+const POLL_INTERVAL = Number(import.meta.env.VITE_POLL_INTERVAL) || 3000;
+const DISABLE_POLLING = String(import.meta.env.VITE_DISABLE_POLLING || 'false').toLowerCase() === 'true';
+
 const ManagerDashboard: React.FC = () => {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+
   const [unsoldPlayers, setUnsoldPlayers] = useState<Player[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [auctionState, setAuctionState] = useState<any>(null);
@@ -19,16 +36,40 @@ const ManagerDashboard: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  useEffect(() => {
-    initializeSocket();
-    loadData();
+  // guard so we only initialize socket once (prevents duplicate listeners)
+  const socketInitializedRef = useRef(false);
+
+  // short-circuit polling during writes
+  const suspendPollingRef = useRef(false);
+
+  // helper: normalize player object to ensure strikeRate is number and id exists
+  const normalizePlayer = useCallback((p: any): Player => {
+    const strikeRateRaw = (p.strikeRate ?? p.SR ?? p.sr ?? p['SR'] ?? 0);
+    const strikeRate = Number(strikeRateRaw) || 0;
+    // Ensure numeric conversions for numeric fields too just in case
+    return {
+      ...p,
+      id: String(p.id ?? p._id ?? p._id?.toString?.() ?? ''),
+      name: String(p.name ?? ''),
+      age: Number(p.age ?? 0),
+      role: String(p.role ?? ''),
+      matches: Number(p.matches ?? 0),
+      runs: Number(p.runs ?? 0),
+      fifties: Number(p.fifties ?? p['50s'] ?? 0),
+      hundreds: Number(p.hundreds ?? p['100s'] ?? 0),
+      strikeRate,
+      wickets: Number(p.wickets ?? 0),
+      economy: Number(p.economy ?? 0),
+      basePrice: Number(p.basePrice ?? p.base_price ?? 0),
+      status: p.status ?? 'unsold',
+      soldPrice: p.soldPrice ?? p.sold_price ?? null,
+      soldToTeamId: p.soldToTeamId ?? p.sold_to_team_id ?? null,
+      soldToTeam: p.soldToTeam ?? null,
+    } as Player;
   }, []);
 
-  useEffect(() => {
-    loadUnsoldPlayers();
-  }, [search, roleFilter]);
-
-  const loadData = async () => {
+  // load core dashboard data (auction state + teams)
+  const loadData = useCallback(async () => {
     try {
       const [stateData, teamsData] = await Promise.all([
         api.getAuctionState(),
@@ -39,27 +80,129 @@ const ManagerDashboard: React.FC = () => {
     } catch (error) {
       console.error('Error loading data:', error);
     }
-  };
+  }, []);
 
-  const loadUnsoldPlayers = async () => {
+  // load unsold players (replaces state, normalized)
+  const loadUnsoldPlayers = useCallback(async () => {
     try {
-      const players = await api.getUnsoldPlayers(search, roleFilter);
-      setUnsoldPlayers(players);
+      const playersRaw = await api.getUnsoldPlayers(search, roleFilter);
+      const normalized = (playersRaw || []).map(normalizePlayer);
+
+      // dedupe by id (just in case) and keep original order from server
+      const seen = new Set<string>();
+      const deduped: Player[] = [];
+      for (const pl of normalized) {
+        if (!pl.id) continue; // skip invalid entries
+        if (!seen.has(pl.id)) {
+          seen.add(pl.id);
+          deduped.push(pl);
+        }
+      }
+
+      setUnsoldPlayers(deduped);
+
+      // small debug log: remove in production
+      // eslint-disable-next-line no-console
+      console.debug('Loaded unsold players:', deduped.length, deduped.slice(0, 5).map(p => `${p.name}:${p.strikeRate}`));
     } catch (error) {
       console.error('Error loading players:', error);
     }
+  }, [search, roleFilter, normalizePlayer]);
+
+  // initialize socket once and load initial data
+  useEffect(() => {
+    if (!socketInitializedRef.current) {
+      try {
+        initializeSocket();
+      } catch (err) {
+        console.warn('Socket initialize error (ignored):', err);
+      }
+      socketInitializedRef.current = true;
+    }
+
+    // initial load
+    loadData();
+    loadUnsoldPlayers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once
+
+  // polling effect: polls unsold players + auction state periodically
+  useEffect(() => {
+    if (DISABLE_POLLING) {
+      // Polling disabled via env var
+      return;
+    }
+
+    let mounted = true;
+    const interval = setInterval(async () => {
+      if (!mounted) return;
+      if (suspendPollingRef.current) {
+        // skip one cycle if suspended
+        suspendPollingRef.current = false;
+        return;
+      }
+      try {
+        // fetch both in parallel for efficiency
+        const [playersRaw, stateData, teamsData] = await Promise.all([
+          api.getUnsoldPlayers(search, roleFilter),
+          api.getAuctionState(),
+          api.getTeamsSummary(),
+        ]);
+
+        // only update if still mounted
+        if (!mounted) return;
+
+        // normalize players and set (replace)
+        const normalized = (playersRaw || []).map(normalizePlayer);
+        const seen = new Set<string>();
+        const deduped: Player[] = [];
+        for (const pl of normalized) {
+          if (!pl.id) continue;
+          if (!seen.has(pl.id)) {
+            seen.add(pl.id);
+            deduped.push(pl);
+          }
+        }
+        setUnsoldPlayers(deduped);
+
+        // set state & teams (replace)
+        setAuctionState(stateData);
+        setTeams(teamsData);
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    }, POLL_INTERVAL);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [search, roleFilter, normalizePlayer]);
+
+  // re-run unsold players when search/roleFilter change immediately
+  useEffect(() => {
+    // immediate fetch on filter/search change
+    loadUnsoldPlayers();
+  }, [search, roleFilter, loadUnsoldPlayers]);
+
+  // helper to suspend polling for one cycle (used around writes)
+  const suspendPollingOnce = () => {
+    suspendPollingRef.current = true;
   };
 
   const handlePutIntoAuction = async (playerId: number) => {
     setLoading(true);
     setMessage(null);
     try {
+      suspendPollingOnce();
       await api.setCurrentPlayer(playerId);
       setMessage({ type: 'success', text: 'Player put into auction!' });
+
+      // refresh immediately after write
       await loadData();
       await loadUnsoldPlayers();
     } catch (error: any) {
-      setMessage({ type: 'error', text: error.message });
+      setMessage({ type: 'error', text: error?.message ?? 'Failed to put player into auction' });
     } finally {
       setLoading(false);
     }
@@ -74,6 +217,7 @@ const ManagerDashboard: React.FC = () => {
     setLoading(true);
     setMessage(null);
     try {
+      suspendPollingOnce();
       await api.sellPlayer(selectedTeam, parseFloat(soldAmount));
       const soldTeam = teams.find(t => t.id === selectedTeam);
       setMessage({
@@ -82,10 +226,12 @@ const ManagerDashboard: React.FC = () => {
       });
       setSelectedTeam(null);
       setSoldAmount('');
+
+      // refresh immediately after write
       await loadData();
       await loadUnsoldPlayers();
     } catch (error: any) {
-      setMessage({ type: 'error', text: error.message });
+      setMessage({ type: 'error', text: error?.message ?? 'Failed to sell player' });
     } finally {
       setLoading(false);
     }
@@ -222,7 +368,7 @@ const ManagerDashboard: React.FC = () => {
                         <td className="px-4 py-3 text-gray-300">{player.role}</td>
                         <td className="px-4 py-3 text-yellow-400 font-semibold">₹{player.basePrice} Cr</td>
                         <td className="px-4 py-3 text-gray-300 text-sm">
-                          {player.runs}R, {player.wickets}W, SR: {player.strikeRate.toFixed(1)}
+                          {player.runs}R, {player.wickets}W, SR: {(player.strikeRate ?? 0).toFixed(1)}
                         </td>
                         <td className="px-4 py-3">
                           <button
