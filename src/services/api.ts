@@ -65,7 +65,7 @@ const getAuthHeader = () => {
 
 export const api = {
   async login(username: string, password: string): Promise<LoginResponse> {
-    const response = await fetch(`${API_BASE_URL}/auth/login`, {
+    const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
@@ -85,7 +85,7 @@ export const api = {
     if (role && role !== 'all') params.append('role', role);
 
     const response = await fetch(
-      `${API_BASE_URL}/players/unsold?${params.toString()}`,
+      `${API_BASE_URL}/api/players/unsold?${params.toString()}`,
       {
         headers: getAuthHeader(),
       }
@@ -96,7 +96,7 @@ export const api = {
   },
 
   async setCurrentPlayer(playerId: number): Promise<Player> {
-    const response = await fetch(`${API_BASE_URL}/auction/current`, {
+    const response = await fetch(`${API_BASE_URL}/api/auction/current`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -114,7 +114,7 @@ export const api = {
   },
 
   async sellPlayer(teamId: number, amount: number): Promise<any> {
-    const response = await fetch(`${API_BASE_URL}/auction/sell`, {
+    const response = await fetch(`${API_BASE_URL}/api/auction/sell`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -132,7 +132,7 @@ export const api = {
   },
 
   async getAuctionState(): Promise<AuctionState> {
-    const response = await fetch(`${API_BASE_URL}/auction/state`, {
+    const response = await fetch(`${API_BASE_URL}/api/auction/state`, {
       headers: getAuthHeader(),
     });
 
@@ -141,7 +141,7 @@ export const api = {
   },
 
   async getTeamsSummary(): Promise<Team[]> {
-    const response = await fetch(`${API_BASE_URL}/teams/summary`, {
+    const response = await fetch(`${API_BASE_URL}/api/teams/summary`, {
       headers: getAuthHeader(),
     });
 
@@ -150,7 +150,7 @@ export const api = {
   },
 
   async getTeamSquad(teamId: number): Promise<any> {
-    const response = await fetch(`${API_BASE_URL}/teams/${teamId}/squad`, {
+    const response = await fetch(`${API_BASE_URL}/api/teams/${teamId}/squad`, {
       headers: getAuthHeader(),
     });
 
@@ -159,7 +159,7 @@ export const api = {
   },
 
   async getTeamAnalytics(teamId: number): Promise<any> {
-    const response = await fetch(`${API_BASE_URL}/teams/${teamId}/analytics`, {
+    const response = await fetch(`${API_BASE_URL}/api/teams/${teamId}/analytics`, {
       headers: getAuthHeader(),
     });
 
